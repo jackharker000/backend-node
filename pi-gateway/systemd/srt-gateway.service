@@ -1,0 +1,39 @@
+[Unit]
+Description=Sail Race Tracker Pi gateway (serial <-> cloud)
+Documentation=https://example.invalid/srt-gateway
+# Only start once the network is actually up — the uplink/downlink need it.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as the unprivileged base-node user. That user MUST be in the `dialout`
+# group so it can open /dev/ttyACM* (the base node serial port). The
+# SupplementaryGroups line below also grants dialout for this unit explicitly.
+User=base-node
+Group=base-node
+SupplementaryGroups=dialout
+
+# Config lives in /etc; secrets (cloud API key) can be injected via env without
+# editing the file — e.g. an EnvironmentFile or a drop-in:
+#   systemctl edit srt-gateway   ->   [Service]\nEnvironment=SRT_GATEWAY_CLOUD_API_KEY=...
+ExecStart=/usr/bin/python3 -m srt_gateway.main --config /etc/srt-gateway/config.toml
+
+# The package must be importable. Either pip-install it (recommended) or point
+# PYTHONPATH at the checkout's src/ dir:
+Environment=PYTHONUNBUFFERED=1
+# Environment=PYTHONPATH=/home/base-node/srt-gateway/src
+
+# Resilience: always come back, but don't hot-loop on a hard config error.
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Light hardening (loosen if it interferes with serial / db paths).
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/home/base-node/srt-gateway
+
+[Install]
+WantedBy=multi-user.target

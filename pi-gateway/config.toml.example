@@ -1,0 +1,31 @@
+# config.toml.example — Sail Race Tracker Pi gateway configuration.
+#
+# Install to /etc/srt-gateway/config.toml. Every key here can be overridden at
+# runtime by an environment variable named SRT_GATEWAY_<KEY_UPPERCASE>, e.g.
+#   SRT_GATEWAY_CLOUD_API_KEY=secret   SRT_GATEWAY_SERIAL_DEVICE=auto
+# Env always wins over this file, which wins over the built-in defaults.
+
+# Serial device for the base node. Use "auto" (or "") to auto-detect the first
+# /dev/ttyACM* then /dev/ttyUSB*. A fixed path is more predictable in the field.
+serial_device = "/dev/ttyACM1"
+serial_baud = 115200
+
+# Cloud endpoint base URL. /ingest and /race/current are appended by the
+# uplink and downlink respectively.
+cloud_url = "https://cloud.example.com"
+# Prefer setting the key via the SRT_GATEWAY_CLOUD_API_KEY env var / a systemd
+# drop-in rather than committing it here.
+cloud_api_key = ""
+
+# How often (seconds) the uplink idles when the queue is empty, and how often
+# the downlink polls the cloud for the current race state.
+ingest_interval_s = 5
+downlink_interval_s = 10
+
+# Durable local SQLite store (WAL). Must be writable by the base-node user.
+db_path = "/home/base-node/srt-gateway/srt.db"
+
+# Local /health HTTP endpoint port.
+health_port = 8080
+
+log_level = "INFO"
