@@ -78,3 +78,25 @@ All 69 tests pass with no hardware and no network.
   own epoch (the base self-anchors from GPS when sent `0`).
 * `boats`/`races` correlation is minimal (downlink mirrors race `state` only);
   boat↔node resolution is left to the cloud.
+
+## Live bring-up fixes (2026-06-28)
+
+- **store.py: SQLite cross-thread fix.** The serial reader runs in its own
+  thread; the Store connection was main-thread-only, causing
+  `sqlite3.ProgrammingError: SQLite objects created in a thread can only be
+  used in that same thread` on the first decoded uplink — so zero fixes were
+  ever persisted on real hardware. Fixed: open the connection with
+  `check_same_thread=False` and serialize all access with a `threading.RLock`
+  (wrapped `insert_fix`). Proven with a threaded smoke test (50 cross-thread
+  inserts, 0 errors).
+- **serial_io.py: harden poll_once against re-enumeration faults.** A board
+  brown-out / USB re-enumeration can leave pyserial's handle in a half-valid
+  state where `read()` raises `TypeError`/`OSError`/`AttributeError` on a
+  NoneType fd/size rather than `SerialException`. Now any such read fault is
+  treated as a disconnect → clean close → reconnect next cycle, so the reader
+  thread never dies. Also coerce `read_size` to a valid int and guard against a
+  concurrent `_close()` racing the read.
+- **Verified end-to-end on hardware:** boat (node 1) → base (SX1276 TTGO) →
+  USB serial → gateway → SQLite. Live fixes persisted; `/health` reports
+  serial connected + per-node last-position. Installed + running as the
+  `srt-gateway` systemd service (enabled, Restart=always).

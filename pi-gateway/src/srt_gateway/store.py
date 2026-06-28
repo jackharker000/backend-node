@@ -43,6 +43,7 @@ Key tested properties:
 
 import os
 import sqlite3
+import threading
 
 __all__ = ["Store", "DEDUP_WINDOW_MS"]
 
@@ -78,7 +79,11 @@ class Store:
 
     def __init__(self, db_path, schema_path=None):
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path)
+        # check_same_thread=False: the serial reader thread and the main thread
+        # both touch the store. We serialize every access with self._lock below,
+        # so sharing one connection across threads is safe (writes never overlap).
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._lock = threading.RLock()
         self._conn.row_factory = sqlite3.Row
         # WAL: concurrent reader/writer; NORMAL: durable across app crashes.
         self._conn.execute("PRAGMA journal_mode=WAL;")
@@ -120,66 +125,67 @@ class Store:
         lat = uplink["lat"]
         lon = uplink["lon"]
 
-        cur = self._conn.cursor()
-        try:
-            # Wrap-aware dedup: an existing same-(node_id, seq) row only counts
-            # as a duplicate if it is recent. A stale row (older than the
-            # window) is from a previous wrap-cycle -> retire it so the new fix
-            # can take the unique slot.
-            row = cur.execute(
-                "SELECT id, ts_ms FROM fixes WHERE node_id=? AND seq=?",
-                (node_id, seq),
-            ).fetchone()
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                # Wrap-aware dedup: an existing same-(node_id, seq) row only counts
+                # as a duplicate if it is recent. A stale row (older than the
+                # window) is from a previous wrap-cycle -> retire it so the new fix
+                # can take the unique slot.
+                row = cur.execute(
+                    "SELECT id, ts_ms FROM fixes WHERE node_id=? AND seq=?",
+                    (node_id, seq),
+                ).fetchone()
 
-            inserted = False
-            if row is not None:
-                if abs(ts_ms - row["ts_ms"]) <= DEDUP_WINDOW_MS:
-                    # Recent same-(node_id, seq) -> a true duplicate resend.
-                    inserted = False
+                inserted = False
+                if row is not None:
+                    if abs(ts_ms - row["ts_ms"]) <= DEDUP_WINDOW_MS:
+                        # Recent same-(node_id, seq) -> a true duplicate resend.
+                        inserted = False
+                    else:
+                        # From a previous/next wrap-cycle -> genuinely new fix.
+                        # Retire the stale row's seq slot (set NULL so it leaves the
+                        # UNIQUE(node_id, seq) index; SQLite treats NULLs as
+                        # distinct) WITHOUT deleting it -- the store is append-only,
+                        # so that old fix's position/time history is preserved.
+                        cur.execute(
+                            "UPDATE fixes SET seq=NULL WHERE id=?", (row["id"],)
+                        )
+                        cur.execute(
+                            """INSERT INTO fixes
+                                   (node_id, boat_id, race_id, ts_ms, lat, lon,
+                                    sog, cog, battery_mv, seq, rssi, snr, flags,
+                                    synced, rx_time_ms)
+                               VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                       0, ?)""",
+                            (node_id, ts_ms, lat, lon, sog, cog, battery_mv, seq,
+                             rssi, snr, flags, rx_time_ms),
+                        )
+                        inserted = True
                 else:
-                    # From a previous/next wrap-cycle -> genuinely new fix.
-                    # Retire the stale row's seq slot (set NULL so it leaves the
-                    # UNIQUE(node_id, seq) index; SQLite treats NULLs as
-                    # distinct) WITHOUT deleting it -- the store is append-only,
-                    # so that old fix's position/time history is preserved.
-                    cur.execute(
-                        "UPDATE fixes SET seq=NULL WHERE id=?", (row["id"],)
-                    )
+                    # Fast path: ON CONFLICT DO NOTHING guards against a racing
+                    # writer that inserted the same (node_id, seq) since our SELECT.
                     cur.execute(
                         """INSERT INTO fixes
                                (node_id, boat_id, race_id, ts_ms, lat, lon,
                                 sog, cog, battery_mv, seq, rssi, snr, flags,
                                 synced, rx_time_ms)
                            VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                   0, ?)""",
+                                   0, ?)
+                           ON CONFLICT(node_id, seq) DO NOTHING""",
                         (node_id, ts_ms, lat, lon, sog, cog, battery_mv, seq,
                          rssi, snr, flags, rx_time_ms),
                     )
-                    inserted = True
-            else:
-                # Fast path: ON CONFLICT DO NOTHING guards against a racing
-                # writer that inserted the same (node_id, seq) since our SELECT.
-                cur.execute(
-                    """INSERT INTO fixes
-                           (node_id, boat_id, race_id, ts_ms, lat, lon,
-                            sog, cog, battery_mv, seq, rssi, snr, flags,
-                            synced, rx_time_ms)
-                       VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                               0, ?)
-                       ON CONFLICT(node_id, seq) DO NOTHING""",
-                    (node_id, ts_ms, lat, lon, sog, cog, battery_mv, seq,
-                     rssi, snr, flags, rx_time_ms),
-                )
-                inserted = cur.rowcount > 0
+                    inserted = cur.rowcount > 0
 
-            # Always refresh the node summary from the newest fix we've seen.
-            self._upsert_node_from_fix(cur, node_id, ts_ms, battery_mv, rssi)
+                # Always refresh the node summary from the newest fix we've seen.
+                self._upsert_node_from_fix(cur, node_id, ts_ms, battery_mv, rssi)
 
-            self._conn.commit()
-            return inserted
-        except Exception:
-            self._conn.rollback()
-            raise
+                self._conn.commit()
+                return inserted
+            except Exception:
+                self._conn.rollback()
+                raise
 
     @staticmethod
     def _upsert_node_from_fix(cur, node_id, ts_ms, battery_mv, rssi):

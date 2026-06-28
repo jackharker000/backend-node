@@ -272,7 +272,7 @@ class SerialReader:
         self.baud = baud
         self.port_globs = tuple(port_globs)
         self.replay_path = replay_path
-        self.read_size = read_size
+        self.read_size = int(read_size) if read_size else 4096
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
         self.on_error = on_error
@@ -375,14 +375,29 @@ class SerialReader:
             if not self._reconnect():
                 return 0  # stop requested mid-reconnect
 
+        ser = self._ser
+        if ser is None:
+            # Raced with a concurrent _close(); treat as a dropped link.
+            self._close()
+            return 0
         try:
-            chunk = self._ser.read(self.read_size)
+            chunk = ser.read(self.read_size)
         except _serial_exception_types() as exc:
             # The link dropped (brown-out / unplug). Close + flip connected
             # False now; the *next* poll_once will back off and reopen. The
             # loop survives — it never raises out of poll_once.
             self.last_error = repr(exc)
             log.warning("serial read failed (%s); will reconnect", exc)
+            self._close()
+            return 0
+        except (TypeError, AttributeError, OSError, ValueError) as exc:
+            # A re-enumerated device can leave pyserial's internal handle in a
+            # half-valid state where read() raises TypeError/OSError on a
+            # NoneType fd/size rather than SerialException. Treat ANY such read
+            # fault as a disconnect: close cleanly and reconnect next cycle so a
+            # board brown-out / USB re-enumeration never kills the loop.
+            self.last_error = repr(exc)
+            log.warning("serial read fault (%s); reopening port", exc)
             self._close()
             return 0
 
